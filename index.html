@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Base → Arc USDC Bridge</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header>
+  <h1>Base &#8594; Arc USDC Bridge</h1>
+  <p class="subtitle"><span class="pill">Circle CCTP</span> Burn on Base &middot; Mint + forward on Arc</p>
+</header>
+
+<main>
+  <section class="card" id="wallet-card">
+    <h2>Wallet</h2>
+    <button id="connect-btn" type="button">Connect wallet</button>
+    <p id="account-line" class="muted">Not connected.</p>
+    <p id="chain-line" class="muted"></p>
+  </section>
+
+  <section class="card" id="bridge-card">
+    <h2>Bridge</h2>
+
+    <label for="amount-input">Amount (USDC on Base)</label>
+    <input id="amount-input" type="text" inputmode="decimal" placeholder="e.g. 10.00" autocomplete="off">
+
+    <label for="recipient-input">Recipient on Arc (defaults to connected account)</label>
+    <input id="recipient-input" type="text" placeholder="0x&hellip;" autocomplete="off" spellcheck="false">
+
+    <fieldset>
+      <legend>Finality</legend>
+      <label class="radio"><input type="radio" name="finality" value="fast" checked> Fast (threshold 1000)</label>
+      <label class="radio"><input type="radio" name="finality" value="standard"> Standard (threshold 2000)</label>
+    </fieldset>
+
+    <div id="quote-box" class="quote" aria-live="polite">
+      <h3>Fee quote</h3>
+      <dl>
+        <div><dt>Forward fee</dt><dd id="q-forward">&mdash;</dd></div>
+        <div><dt>Protocol fee</dt><dd id="q-protocol">&mdash;</dd></div>
+        <div><dt>Max fee</dt><dd id="q-max">&mdash;</dd></div>
+        <div><dt>Est. receive on Arc</dt><dd id="q-net">&mdash;</dd></div>
+      </dl>
+      <p id="quote-note" class="muted"></p>
+    </div>
+
+    <button id="bridge-btn" type="button" disabled>Bridge</button>
+  </section>
+
+  <section class="card" id="steps-card">
+    <h2>Status</h2>
+    <ol id="steps">
+      <li data-step="quote">Quote</li>
+      <li data-step="approve">Approve USDC</li>
+      <li data-step="burn">Burn on Base</li>
+      <li data-step="poll">Relay &amp; forward (Iris)</li>
+      <li data-step="done">Done</li>
+    </ol>
+  </section>
+
+  <section class="card hidden" id="result-card">
+    <h2>Result</h2>
+    <p>Base burn tx: <a id="burn-link" href="#" target="_blank" rel="noreferrer">view</a></p>
+    <p>Arc forward tx: <a id="forward-link" href="#" target="_blank" rel="noreferrer">view</a></p>
+  </section>
+
+  <p id="error-box" class="error hidden" role="alert"></p>
+</main>
+
+<footer>
+  <p class="muted">Static page. Your wallet signs everything; no private keys ever leave your device. Source chain: Base only.</p>
+</footer>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

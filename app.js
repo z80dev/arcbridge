@@ -1,12 +1,13 @@
 import {
   BrowserProvider,
   Contract,
+  JsonRpcProvider,
   parseUnits,
   formatUnits,
   zeroPadValue,
   ZeroHash,
   getAddress,
-} from 'https://esm.sh/ethers@6.17.0';
+} from 'ethers';
 
 const BASE_CHAIN_ID = 8453;
 const BASE_DOMAIN = 6;
@@ -19,9 +20,13 @@ const DESTINATION_CALLER = ZeroHash;
 const FEE_API = 'https://iris-api.circle.com/v2/burn/USDC/fees/6/26?forward=true';
 const POLL_INTERVAL_MS = 6000;
 const POLL_TIMEOUT_MS = 20 * 60 * 1000;
+const ARC_POLL_INTERVAL_MS = 2000;
+const ARC_POLL_TIMEOUT_MS = 5 * 60 * 1000;
+const ARC_RPCS = ['https://rpc.mainnet.arc.io', 'https://rpc.blockdaemon.mainnet.arc.io'];
 const TX_HASH_RE = /^0x[0-9a-f]{64}$/i;
 const BASE_EXPLORER = 'https://basescan.org/tx/';
 const ARC_EXPLORER = 'https://explorer.arc.io/tx/';
+const PENDING_KEY = 'arcbridge.pending.v1';
 
 const ERC20_ABI = [
   'function balanceOf(address) view returns (uint256)',
@@ -45,6 +50,7 @@ const resultCard = $('result-card');
 const burnLink = $('burn-link');
 const forwardLink = $('forward-link');
 const quoteNote = $('quote-note');
+const statusNote = $('status-note');
 const qForward = $('q-forward');
 const qProtocol = $('q-protocol');
 const qMax = $('q-max');
@@ -55,8 +61,9 @@ const stepEls = Object.fromEntries(
 
 let provider = null;
 let account = null;
-let quote = null; // { amount, maxFee, protocolFee, forwardFee, net, threshold }
+let quote = null; // { amount, threshold, requestId, maxFee, protocolFee, forwardFee, net }
 let quoteTimer = null;
+let quoteRequestId = 0;
 let bridging = false;
 
 function setError(msg) {
@@ -78,6 +85,17 @@ function setStep(name, state) {
 
 function resetSteps() {
   for (const el of Object.values(stepEls)) el.classList.remove('active', 'done', 'failed');
+}
+
+function setStatus(msg) {
+  if (!statusNote) return;
+  statusNote.textContent = msg ?? '';
+  statusNote.classList.toggle('hidden', !msg);
+}
+
+function setQuoteStale() {
+  quote = null;
+  bridgeBtn.disabled = true;
 }
 
 function isUserRejection(err) {
@@ -164,6 +182,7 @@ function pickTier(feePayload, threshold) {
 }
 
 async function refreshQuote() {
+  const requestId = ++quoteRequestId; // stale responses are dropped; only the latest mutates quote/DOM
   quote = null;
   qForward.textContent = qProtocol.textContent = qMax.textContent = qNet.textContent = '\u2014';
   quoteNote.textContent = '';
@@ -179,8 +198,10 @@ async function refreshQuote() {
   const threshold = selectedThreshold();
   try {
     const res = await fetch(FEE_API);
+    if (requestId !== quoteRequestId) return; // a newer quote request superseded this one
     if (!res.ok) throw new Error(`Fee API returned ${res.status}.`);
     const payload = await res.json();
+    if (requestId !== quoteRequestId) return;
     const tier = pickTier(payload, threshold);
     if (!tier) throw new Error('No fee tier returned by the Circle fee API.');
 
@@ -194,7 +215,11 @@ async function refreshQuote() {
       setStep('quote', 'failed');
       return;
     }
-    quote = { amount, maxFee, protocolFee, forwardFee: forwardFeeHigh, net: amount - maxFee, threshold };
+    quote = { amount, threshold, requestId, maxFee, protocolFee, forwardFee: forwardFeeHigh, net: amount - maxFee };
+    if (requestId !== quoteRequestId) {
+      quote = null; // input changed while this fetch was in flight
+      return;
+    }
     qForward.textContent = fmt(forwardFeeHigh);
     qProtocol.textContent = fmt(protocolFee);
     qMax.textContent = fmt(maxFee);
@@ -204,6 +229,7 @@ async function refreshQuote() {
     setStep('quote', 'done');
     if (!bridging && account && parseRecipient()) bridgeBtn.disabled = false;
   } catch (err) {
+    if (requestId !== quoteRequestId) return;
     quoteNote.textContent = `Quote failed: ${err.message}`;
     setStep('quote', 'failed');
   }
@@ -269,13 +295,79 @@ function showTxLink(el, hash, base) {
   el.href = TX_HASH_RE.test(hash) ? base + hash : '#';
 }
 
-async function bridge() {
+// Persistence: one pending slot, written the moment the burn receipt confirms.
+function savePending(rec) {
+  try {
+    localStorage.setItem(PENDING_KEY, JSON.stringify(rec));
+  } catch {
+    /* storage unavailable (private mode): bridge still proceeds, just not resumable */
+  }
+}
+
+function loadPending() {
+  try {
+    const raw = localStorage.getItem(PENDING_KEY);
+    if (!raw) return null;
+    const rec = JSON.parse(raw);
+    return rec && TX_HASH_RE.test(rec.burnHash ?? '') ? rec : null;
+  } catch {
+    return null;
+  }
+}
+
+function clearPending() {
+  try {
+    localStorage.removeItem(PENDING_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+// Tracks the burn hash owned by the active (or resumed) bridge run, so failure
+// flags only land on this run's record — a newer run may have overwritten the slot.
+let currentBurnHash = null;
+
+function markPendingFailed() {
+  const rec = loadPending();
+  if (!rec || rec.burnHash !== currentBurnHash) return;
+  savePending({ ...rec, failed: true });
+}
+
+// Arc RPC failover: primary, then fallback; each provider carries its staticConnection count.
+let arcProviderIndex = 0;
+function makeArcProvider() {
+  return new JsonRpcProvider(ARC_RPCS[arcProviderIndex % ARC_RPCS.length], null, { staticNetwork: true });
+}
+
+// Done is gated on the Arc receipt: status 1 only. Null receipt = still pending.
+async function waitForArcReceipt(forwardHash, onTick) {
+  let provider = makeArcProvider();
+  const deadline = Date.now() + ARC_POLL_TIMEOUT_MS;
+  let lastError = null;
+  while (Date.now() < deadline) {
+    try {
+      const receipt = await provider.getTransactionReceipt(forwardHash);
+      if (receipt) return receipt;
+    } catch (err) {
+      lastError = err;
+      arcProviderIndex++; // failover to the next RPC on transport errors
+      provider = makeArcProvider();
+    }
+    onTick?.();
+    await new Promise((r) => setTimeout(r, ARC_POLL_INTERVAL_MS));
+  }
+  throw new Error(
+    `Timed out waiting for the Arc receipt (5 min). Check the Arc tx manually.${lastError ? ` (last RPC error: ${lastError.message})` : ''}`,
+  );
+}
+
+async function bridge(resume = null) {
   if (bridging) return; // single-flight: synchronous guard before first await drops double-clicks
   bridging = true;
   bridgeBtn.disabled = true;
   connectBtn.disabled = true;
   try {
-    await bridgeInner();
+    await bridgeInner(resume);
   } finally {
     bridging = false;
     connectBtn.disabled = false;
@@ -283,100 +375,186 @@ async function bridge() {
   }
 }
 
-async function bridgeInner() {
+async function bridgeInner(resume = null) {
   setError(null);
-  resultCard.classList.add('hidden');
-  resetSteps();
-  if (!window.ethereum || !provider || !account) {
-    setError('Connect your wallet first.');
-    return;
-  }
-  const recipient = parseRecipient();
-  if (!recipient) {
-    setError('Recipient address is invalid. Check the checksum and try again.');
-    return;
-  }
-  if (!quote || quote.amount !== parseAmount()) {
-    await refreshQuote();
-  }
-  if (!quote) {
-    setError('No valid fee quote. Fix the amount and try again.');
-    return;
-  }
-  const { amount, maxFee, threshold } = quote;
+  setStatus(null);
+  // Never show a previous run's forward hash while a new run is in flight.
+  forwardLink.textContent = 'view';
+  forwardLink.href = '#';
 
-  let signer;
-  try {
-    await ensureBaseChain();
-    signer = await provider.getSigner();
-  } catch (err) {
-    setError(isUserRejection(err) ? 'Cancelled in wallet.' : (err.message ?? 'Failed to access signer.'));
-    return;
-  }
+  let amount;
+  let maxFee;
+  let threshold;
+  let recipient;
+  let burnHash;
 
-  try {
-    const usdc = new Contract(BASE_USDC, ERC20_ABI, signer);
-    const messenger = new Contract(TOKEN_MESSENGER, MESSENGER_ABI, signer);
-
-    // Preflight: Arc must be registered on the Base messenger.
-    const remote = await messenger.remoteTokenMessengers(ARC_DOMAIN);
-    const expected = zeroPadValue(TOKEN_MESSENGER, 32).toLowerCase();
-    if (String(remote).toLowerCase() !== expected) {
-      throw new Error('Preflight failed: Arc messenger not registered on Base messenger. Aborting.');
+  if (resume) {
+    // Wallet-free resume: the persisted record is the sole source of truth.
+    // No eth_accounts, no ensureBaseChain, no getSigner on this path.
+    amount = BigInt(resume.amountUnits);
+    maxFee = BigInt(resume.maxFeeUnits);
+    threshold = resume.threshold;
+    recipient = getAddress(resume.recipient);
+    burnHash = resume.burnHash;
+    currentBurnHash = burnHash;
+    recipientInput.value = recipient;
+    amountInput.value = formatUnits(amount, 6);
+    for (const radio of document.querySelectorAll('input[name="finality"]')) {
+      radio.checked = (radio.value === 'standard') === (threshold === 2000);
     }
-
-    setStep('approve', 'active');
-    const allowance = await usdc.allowance(account, TOKEN_MESSENGER);
-    if (allowance < amount) {
-      const approveTx = await usdc.approve(TOKEN_MESSENGER, amount);
-      const approveReceipt = await approveTx.wait();
-      if (approveReceipt?.status !== 1) throw new Error('USDC approval reverted on Base.');
-    }
-    setStep('approve', 'done');
-
-    setStep('burn', 'active');
-    const mintRecipient = zeroPadValue(recipient, 32);
-    const burnTx = await messenger.depositForBurnWithHook(
-      amount,
-      ARC_DOMAIN,
-      mintRecipient,
-      BASE_USDC,
-      DESTINATION_CALLER,
-      maxFee,
-      threshold,
-      FORWARD_HOOK_DATA,
-    );
-    const burnReceipt = await burnTx.wait();
-    if (burnReceipt?.status !== 1) throw new Error('Burn reverted on Base.');
-    const burnHash = burnTx.hash;
-    if (!TX_HASH_RE.test(burnHash)) throw new Error('Burn tx returned an invalid hash.');
-    setStep('burn', 'done');
     showTxLink(burnLink, burnHash, BASE_EXPLORER);
     resultCard.classList.remove('hidden');
-
+    setStep('quote', 'done');
+    setStep('approve', 'done');
+    setStep('burn', 'done');
     setStep('poll', 'active');
+    setStatus('Resumed pending bridge\u2026');
+  } else {
+    if (!window.ethereum || !provider || !account) {
+      setError('Connect your wallet first.');
+      return;
+    }
+    recipient = parseRecipient();
+    if (!recipient) {
+      setError('Recipient address is invalid. Check the checksum and try again.');
+      return;
+    }
+    if (!quote || quote.amount !== parseAmount()) {
+      await refreshQuote();
+    }
+    if (!quote) {
+      setError('No valid fee quote. Fix the amount and try again.');
+      return;
+    }
+    // Quote race guard: the quote must still match the inputs at sign time.
+    // Never sign with a stale maxFee/threshold.
+    if (quote.amount !== parseAmount() || quote.threshold !== selectedThreshold()) {
+      setError('Quote changed — review and retry.');
+      return;
+    }
+    ({ amount, maxFee, threshold } = quote);
+  }
+
+  try {
+    if (resume) {
+      // Resumed polling below uses only fetch (Iris) + public Arc RPC — wallet-free.
+    } else {
+      let signer;
+      try {
+        await ensureBaseChain();
+        signer = await provider.getSigner();
+      } catch (err) {
+        setError(isUserRejection(err) ? 'Cancelled in wallet.' : (err.message ?? 'Failed to access signer.'));
+        return;
+      }
+
+      const usdc = new Contract(BASE_USDC, ERC20_ABI, signer);
+      const messenger = new Contract(TOKEN_MESSENGER, MESSENGER_ABI, signer);
+
+      // Preflight: Arc must be registered on the Base messenger.
+      const remote = await messenger.remoteTokenMessengers(ARC_DOMAIN);
+      const expected = zeroPadValue(TOKEN_MESSENGER, 32).toLowerCase();
+      if (String(remote).toLowerCase() !== expected) {
+        throw new Error('Preflight failed: Arc messenger not registered on Base messenger. Aborting.');
+      }
+
+      setStep('approve', 'active');
+      const allowance = await usdc.allowance(account, TOKEN_MESSENGER);
+      if (allowance < amount) {
+        const approveTx = await usdc.approve(TOKEN_MESSENGER, amount);
+        const approveReceipt = await approveTx.wait();
+        if (approveReceipt?.status !== 1) throw new Error('USDC approval reverted on Base.');
+      }
+      setStep('approve', 'done');
+
+      setStep('burn', 'active');
+      const mintRecipient = zeroPadValue(recipient, 32);
+      const burnTx = await messenger.depositForBurnWithHook(
+        amount,
+        ARC_DOMAIN,
+        mintRecipient,
+        BASE_USDC,
+        DESTINATION_CALLER,
+        maxFee,
+        threshold,
+        FORWARD_HOOK_DATA,
+      );
+      const burnReceipt = await burnTx.wait();
+      if (burnReceipt?.status !== 1) throw new Error('Burn reverted on Base.');
+      burnHash = burnTx.hash;
+      if (!TX_HASH_RE.test(burnHash)) throw new Error('Burn tx returned an invalid hash.');
+      setStep('burn', 'done');
+      showTxLink(burnLink, burnHash, BASE_EXPLORER);
+      resultCard.classList.remove('hidden');
+      // Persist the instant the burn is confirmed, BEFORE any polling starts.
+      currentBurnHash = burnHash;
+      savePending({
+        burnHash,
+        recipient,
+        amountUnits: amount.toString(),
+        threshold,
+        maxFeeUnits: maxFee.toString(),
+        account,
+        createdAt: Date.now(),
+      });
+      setStep('poll', 'active');
+    }
+
     const forwardHash = await pollForwardTx(burnHash);
     setStep('poll', 'done');
+    // Render the Arc link immediately, but Done waits for the Arc receipt.
     showTxLink(forwardLink, forwardHash, ARC_EXPLORER);
+    setStatus('confirming on Arc\u2026');
+
+    const arcReceipt = await waitForArcReceipt(forwardHash, () => setStatus('confirming on Arc\u2026 (still pending)'));
+    if (arcReceipt.status !== 1) {
+      markPendingFailed();
+      setStep('done', 'failed');
+      throw new Error('forward tx reverted');
+    }
+    // Arc confirmed: only now is the bridge Done and the pending slot cleared.
+    setStatus(null);
     setStep('done', 'done');
+    clearPending();
   } catch (err) {
     for (const name of ['approve', 'burn', 'poll']) {
       if (stepEls[name]?.classList.contains('active')) setStep(name, 'failed');
     }
-    setError(isUserRejection(err) ? 'Cancelled in wallet.' : (err.message ?? 'Bridge failed.'));
+    if (err.message === 'forward tx reverted') {
+      // Keep both explorer links and the failed pending record visible.
+      setError('forward tx reverted — see both transactions below. The pending bridge record was marked failed.');
+    } else {
+      setError(isUserRejection(err) ? 'Cancelled in wallet.' : (err.message ?? 'Bridge failed.'));
+    }
   }
 }
 
 connectBtn.addEventListener('click', connect);
-bridgeBtn.addEventListener('click', bridge);
-amountInput.addEventListener('input', scheduleQuote);
+bridgeBtn.addEventListener('click', () => bridge()); // no args: a click event must never look like a resume record
+amountInput.addEventListener('input', () => {
+  setQuoteStale();
+  scheduleQuote();
+});
 recipientInput.addEventListener('input', () => {
   setError(null);
-  bridgeBtn.disabled = bridging || !(account && quote && parseRecipient() && quote.amount === parseAmount());
+  setQuoteStale();
+  scheduleQuote();
 });
 for (const radio of document.querySelectorAll('input[name="finality"]')) {
-  radio.addEventListener('change', scheduleQuote);
+  radio.addEventListener('change', () => {
+    setQuoteStale();
+    scheduleQuote();
+  });
 }
+
+// Resume: if a pending bridge was persisted, restore UI and continue the poll
+// purely wallet-free (record + Iris + public Arc RPC). No wallet required.
+async function resumePending() {
+  const rec = loadPending();
+  if (!rec || rec.failed) return;
+  await bridge(rec); // same single-flight latch as a click; bridgeInner handles the wallet-free path
+}
+
 if (window.ethereum) {
   window.ethereum.on?.('accountsChanged', (accounts) => {
     account = accounts?.[0] ? getAddress(accounts[0]) : null;
@@ -385,4 +563,10 @@ if (window.ethereum) {
     scheduleQuote();
   });
   window.ethereum.on?.('chainChanged', () => window.location.reload());
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', resumePending);
+} else {
+  resumePending();
 }

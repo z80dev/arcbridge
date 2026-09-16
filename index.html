@@ -3,8 +3,15 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Base → Arc USDC Bridge</title>
+<title>Base &#8594; Arc USDC Bridge</title>
 <link rel="stylesheet" href="styles.css">
+<script type="importmap">
+{
+  "imports": {
+    "ethers": "./vendor/ethers-6.17.0.min.js"
+  }
+}
+</script>
 </head>
 <body>
 <header>
@@ -62,6 +69,7 @@
 
   <section class="card hidden" id="result-card">
     <h2>Result</h2>
+    <p id="status-note" class="muted hidden" aria-live="polite"></p>
     <p>Base burn tx: <a id="burn-link" href="#" target="_blank" rel="noreferrer">view</a></p>
     <p>Arc forward tx: <a id="forward-link" href="#" target="_blank" rel="noreferrer">view</a></p>
   </section>

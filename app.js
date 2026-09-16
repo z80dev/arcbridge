@@ -326,6 +326,10 @@ function loadPending() {
 
 function clearPending() {
   try {
+    // Hash-conditional: a newer tab/run may have overwritten the one-slot
+    // record — never delete another run's recovery record.
+    const rec = loadPending();
+    if (rec && rec.burnHash !== currentBurnHash) return;
     localStorage.removeItem(PENDING_KEY);
   } catch {
     /* ignore */

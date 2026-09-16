@@ -57,6 +57,7 @@ let provider = null;
 let account = null;
 let quote = null; // { amount, maxFee, protocolFee, forwardFee, net, threshold }
 let quoteTimer = null;
+let bridging = false;
 
 function setError(msg) {
   if (!msg) {
@@ -201,7 +202,7 @@ async function refreshQuote() {
     quoteNote.textContent =
       threshold === 1000 ? 'Fast finality (threshold 1000).' : 'Standard finality (threshold 2000).';
     setStep('quote', 'done');
-    if (account && parseRecipient()) bridgeBtn.disabled = false;
+    if (!bridging && account && parseRecipient()) bridgeBtn.disabled = false;
   } catch (err) {
     quoteNote.textContent = `Quote failed: ${err.message}`;
     setStep('quote', 'failed');
@@ -269,6 +270,20 @@ function showTxLink(el, hash, base) {
 }
 
 async function bridge() {
+  if (bridging) return; // single-flight: synchronous guard before first await drops double-clicks
+  bridging = true;
+  bridgeBtn.disabled = true;
+  connectBtn.disabled = true;
+  try {
+    await bridgeInner();
+  } finally {
+    bridging = false;
+    connectBtn.disabled = false;
+    bridgeBtn.disabled = !(account && quote && parseRecipient() && quote.amount === parseAmount());
+  }
+}
+
+async function bridgeInner() {
   setError(null);
   resultCard.classList.add('hidden');
   resetSteps();
@@ -357,7 +372,7 @@ bridgeBtn.addEventListener('click', bridge);
 amountInput.addEventListener('input', scheduleQuote);
 recipientInput.addEventListener('input', () => {
   setError(null);
-  bridgeBtn.disabled = !(account && quote && parseRecipient() && quote.amount === parseAmount());
+  bridgeBtn.disabled = bridging || !(account && quote && parseRecipient() && quote.amount === parseAmount());
 });
 for (const radio of document.querySelectorAll('input[name="finality"]')) {
   radio.addEventListener('change', scheduleQuote);

@@ -94,6 +94,7 @@ function setStatus(msg) {
 }
 
 function setQuoteStale() {
+  quoteRequestId++; // synchronously invalidate any in-flight quote fetch
   quote = null;
   bridgeBtn.disabled = true;
 }
@@ -296,11 +297,19 @@ function showTxLink(el, hash, base) {
 }
 
 // Persistence: one pending slot, written the moment the burn receipt confirms.
+// localStorage failure is non-fatal: the burn is already irreversible, so polling
+// continues in memory and the user is warned the bridge won't survive reload.
+let storageWarningShown = false;
+function warnStorageUnavailable() {
+  if (storageWarningShown) return;
+  storageWarningShown = true;
+  quoteNote.textContent = 'Warning: browser storage unavailable — this bridge cannot resume after reload. Keep this tab open until Done.';
+}
 function savePending(rec) {
   try {
     localStorage.setItem(PENDING_KEY, JSON.stringify(rec));
   } catch {
-    /* storage unavailable (private mode): bridge still proceeds, just not resumable */
+    warnStorageUnavailable();
   }
 }
 

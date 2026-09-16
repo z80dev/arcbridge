@@ -391,10 +391,15 @@ async function bridge(resume = null) {
 async function bridgeInner(resume = null) {
   setError(null);
   setStatus(null);
-  // Never show a previous run's forward hash while a new run is in flight.
-  forwardLink.textContent = 'view';
-  forwardLink.href = '#';
-
+  if (!resume) {
+    // Fresh run: wipe the previous run's receipt-gated state before signing.
+    resetSteps();
+    resultCard.classList.add('hidden');
+    burnLink.textContent = 'view';
+    burnLink.href = '#';
+    forwardLink.textContent = 'view';
+    forwardLink.href = '#';
+  }
   let amount;
   let maxFee;
   let threshold;
@@ -402,7 +407,7 @@ async function bridgeInner(resume = null) {
   let burnHash;
 
   if (resume) {
-    // Wallet-free resume: the persisted record is the sole source of truth.
+    resetSteps(); // start from a clean slate, then restore this run's saved state
     // No eth_accounts, no ensureBaseChain, no getSigner on this path.
     amount = BigInt(resume.amountUnits);
     maxFee = BigInt(resume.maxFeeUnits);
